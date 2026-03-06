@@ -56,20 +56,23 @@ SYCL_EXTERNAL inline void store128(void* ptr, Vec128 v) {
 // Cross-GPU flag synchronisation (release/acquire, system scope)
 // Mirrors st_flag_release / ld_flag_acquire in trtllm_allreduce.cuh
 // ---------------------------------------------------------------------------
+// SYCL atomic_ref requires the DefaultOrder template parameter to be one of
+// relaxed / acq_rel / seq_cst (per SYCL 2020 §4.15.3).  The actual
+// release/acquire ordering is supplied per-operation via the overload argument.
 SYCL_EXTERNAL inline void st_flag_release(uint32_t flag, uint32_t* addr) {
   sycl::atomic_ref<uint32_t,
-                   sycl::memory_order::release,
+                   sycl::memory_order::relaxed,   // DefaultOrder (must be relaxed/acq_rel/seq_cst)
                    sycl::memory_scope::system,
                    sycl::access::address_space::global_space>(*addr)
-      .store(flag);
+      .store(flag, sycl::memory_order::release);  // actual per-op ordering
 }
 
 SYCL_EXTERNAL inline uint32_t ld_flag_acquire(uint32_t* addr) {
   return sycl::atomic_ref<uint32_t,
-                          sycl::memory_order::acquire,
+                          sycl::memory_order::relaxed,  // DefaultOrder
                           sycl::memory_scope::system,
                           sycl::access::address_space::global_space>(*addr)
-      .load();
+      .load(sycl::memory_order::acquire);  // actual per-op ordering
 }
 
 // ---------------------------------------------------------------------------
@@ -125,10 +128,13 @@ struct AllReduceParamsSYCL {
   size_t local_rank;
   size_t ranks_per_node;
   uint32_t barrier_flag;
-  uint32_t* peer_barrier_ptrs_in[kMaxRanksPerNode];  // for block_barrier (in phase)
-  void*     peer_comm_buffer_ptrs[kMaxRanksPerNode]; // P2P data staging buffers
-  void*     local_output_buffer_ptr;                 // final norm output
-  void const* local_input_buffer_ptr;               // this rank's input
+  // Embedded arrays of USM device pointers — copied by value into the SYCL
+  // kernel argument space, so the GPU can safely dereference them.
+  uint32_t* peer_barrier_ptrs_in[kMaxRanksPerNode];   // block_barrier (copy→barrier phase)
+  uint32_t* peer_barrier_ptrs_out[kMaxRanksPerNode];  // block_barrier (AllGather phase, TwoShot)
+  void*     peer_comm_buffer_ptrs[kMaxRanksPerNode];  // P2P data staging buffers
+  void*     local_output_buffer_ptr;                  // final norm output
+  void const* local_input_buffer_ptr;                 // this rank's input
   AllReduceFusionParamsSYCL fusion_params;
 };
 
@@ -395,8 +401,10 @@ template <typename T, int RANKS_PER_NODE>
 struct TwoShotAllReduceKernel {
   static constexpr int VEC_SIZE = kBytesPerAccess / static_cast<int>(sizeof(T));
 
+  // params.peer_barrier_ptrs_out[] holds the AllGather-phase barrier pointers.
+  // They are embedded in the struct (copied by value) so GPU code can safely
+  // dereference them — same pattern as params.peer_barrier_ptrs_in[].
   AllReduceParamsSYCL<T>  params;
-  uint32_t**              peer_barrier_ptrs_out;  // second barrier for AllGather phase
   sycl::local_accessor<float, 1> smem;  // unused but kept for uniformity
 
   void operator()(sycl::nd_item<1> item) const {
@@ -451,8 +459,10 @@ struct TwoShotAllReduceKernel {
     }
 
     // Phase D: barrier (out) — ReduceScatter complete on all GPUs.
+    // peer_barrier_ptrs_out[] is embedded in params (copied by value into the
+    // kernel argument space), so it is safe to take its address in device code.
     block_barrier(const_cast<sycl::nd_item<1>&>(item),
-                  peer_barrier_ptrs_out,
+                  const_cast<uint32_t**>(params.peer_barrier_ptrs_out),
                   params.barrier_flag + 1u,  // use next flag value to disambiguate
                   static_cast<int>(params.local_rank),
                   static_cast<int>(params.ranks_per_node), gs);
@@ -531,27 +541,29 @@ inline void launch_oneshot_allreduce(sycl::queue&            q,
 }
 
 // Launch two-shot AllReduce (for large messages).
+// Caller must set params.peer_barrier_ptrs_out[] before calling.
 template <typename T, int RANKS_PER_NODE>
 inline void launch_twoshot_allreduce(sycl::queue&            q,
-                                      AllReduceParamsSYCL<T>& params,
-                                      uint32_t**              peer_barrier_ptrs_out) {
+                                      AllReduceParamsSYCL<T>& params) {
   size_t epb = 0;
   auto [gs, bs] = compute_launch_config<T>(params.elts_total, params.ranks_per_node,
                                            /*twoshot=*/true, epb);
   params.elts_per_block = epb;
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<float, 1> smem(sycl::range<1>(bs), h);
-    TwoShotAllReduceKernel<T, RANKS_PER_NODE> kern{params, peer_barrier_ptrs_out, smem};
+    // params is copied by value into kern, so peer_barrier_ptrs_out[] embedded
+    // in params is also copied — GPU can safely dereference it.
+    TwoShotAllReduceKernel<T, RANKS_PER_NODE> kern{params, smem};
     h.parallel_for(sycl::nd_range<1>(gs * bs, bs), kern);
   });
 }
 
 // Dispatch based on token count heuristic (≤ 128 tokens → one-shot, else two-shot).
+// For two-shot, caller must set params.peer_barrier_ptrs_out[] beforehand.
 // Returns false if the configuration is unsupported.
 template <typename T, int RANKS_PER_NODE>
 inline bool dispatch_allreduce_rmsnorm(sycl::queue&            q,
                                         AllReduceParamsSYCL<T>& params,
-                                        uint32_t**              peer_barrier_ptrs_out,
                                         int                     token_num,
                                         bool                    force_oneshot = false) {
   constexpr size_t VEC_SIZE = kBytesPerAccess / sizeof(T);
@@ -562,7 +574,7 @@ inline bool dispatch_allreduce_rmsnorm(sycl::queue&            q,
   } else {
     // Two-shot: run AllReduce first, then separate RMSNorm kernel.
     if (params.elts_total % (VEC_SIZE * RANKS_PER_NODE) != 0) return false;
-    launch_twoshot_allreduce<T, RANKS_PER_NODE>(q, params, peer_barrier_ptrs_out);
+    launch_twoshot_allreduce<T, RANKS_PER_NODE>(q, params);
     // NOTE: caller is responsible for submitting the separate RMSNorm kernel
     // using intermediate_buffer as input (mirrors the CUDA two-shot path).
   }
